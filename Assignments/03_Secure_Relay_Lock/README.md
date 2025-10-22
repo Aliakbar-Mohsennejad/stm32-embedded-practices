@@ -1,13 +1,13 @@
-# 🔐 Secure Relay Lock System – STM32 (Assignment 3)
+#  Secure Relay Lock System – STM32 (Assignment 3)
 
-## 📘 Overview
+##  Overview
 This project implements a **time-restricted access control system** using an STM32 microcontroller.  
 The relay lock opens only within authorized daily time windows and automatically re-locks after 8 seconds.  
 It demonstrates **RTC alarm scheduling**, **interrupt-driven control**, and **finite-state machine (FSM)** logic with full safety handling.
 
 ---
 
-## 🎯 Objectives
+##  Objectives
 - Apply **RTC alarms** to enforce real-time control.  
 - Implement **secure state transitions** that never leave the relay unintentionally ON.  
 - Use **EXTI interrupts** for buttons with software debounce.  
@@ -16,7 +16,7 @@ It demonstrates **RTC alarm scheduling**, **interrupt-driven control**, and **fi
 
 ---
 
-## ⚙️ Hardware Setup
+##  Hardware Setup
 
 | Component | Function | STM32 Pin |
 |------------|-----------|-----------|
@@ -29,7 +29,7 @@ It demonstrates **RTC alarm scheduling**, **interrupt-driven control**, and **fi
 
 ---
 
-## 🧠 Functional Description
+##  Functional Description
 1. **Startup Check**  
    - Reads backup register (e.g. `0x32F2`) to verify RTC validity.  
    - If invalid → enters *RTC Error* mode (red LED blinks).
@@ -55,7 +55,7 @@ It demonstrates **RTC alarm scheduling**, **interrupt-driven control**, and **fi
 
 ---
 
-## 🧩 LED Patterns
+##  LED Patterns
 
 | System State | Green LED | Red LED | Description |
 |--------------|------------|----------|--------------|
@@ -67,13 +67,4 @@ It demonstrates **RTC alarm scheduling**, **interrupt-driven control**, and **fi
 
 ---
 
-## 💡 Key Code Highlights
 
-### Check Authorized Windows
-```c
-uint8_t IsInWindow(uint8_t h, uint8_t m) {
-  uint16_t mm = h * 60 + m;
-  return ((mm >= 465 && mm < 720) || (mm >= 780 && mm < 1050));
-}
-
-```
