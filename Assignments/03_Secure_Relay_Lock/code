@@ -1,0 +1,376 @@
+/**
+ * Secure Relay Lock System (Assignment 3) – STM32 HAL (F1 example)
+ * - Access requests are accepted only during time windows:
+ *     07:45–12:00 and 13:00–17:30 (editable in IsInWindow()).
+ * - Request button (PB0 → EXTI0) unlocks door for exactly 8 s.
+ *   Pressing again during this period resets (extends) the 8 s.
+ * - Supervisor button (PB1 → EXTI1) disables/enables the whole system.
+ * - Two LEDs show states; RTC validity is checked via a backup register flag.
+ * - All transitions are fail-safe: relay is forced OFF before switching states.
+ *
+ * Pins (default, change if needed):
+ *   PA0: Relay (Output)
+ *   PA1: LED Green (Output)
+ *   PA2: LED Red (Output)
+ *   PB0: Request Button (EXTI0)
+ *   PB1: Supervisor Button (EXTI1)
+ */
+
+#include "stm32f1xx_hal.h"
+
+/* ========= User pin macros (edit as needed) ========= */
+#define RELAY_Port      GPIOA
+#define RELAY_Pin       GPIO_PIN_0
+
+#define LEDG_Port       GPIOA
+#define LEDG_Pin        GPIO_PIN_1
+#define LEDR_Port       GPIOA
+#define LEDR_Pin        GPIO_PIN_2
+
+#define REQ_Port        GPIOB
+#define REQ_Pin         GPIO_PIN_0   // EXTI0
+
+#define SUP_Port        GPIOB
+#define SUP_Pin         GPIO_PIN_1   // EXTI1
+
+/* ========= Globals ========= */
+RTC_HandleTypeDef hrtc;
+
+typedef enum {
+  S_RTC_INVALID = 0,
+  S_DISABLED,
+  S_ENABLED_IDLE,
+  S_ENABLED_WINDOW,
+  S_DOOR_OPEN
+} sys_state_t;
+
+volatile sys_state_t g_state = S_RTC_INVALID;
+volatile uint8_t     g_supervisor_disabled = 0;
+volatile uint8_t     g_door_open = 0;
+volatile uint32_t    g_last_req_ms = 0;
+volatile uint32_t    g_last_sup_ms = 0;
+
+/* Next action for AlarmA: either stop after 8s or none */
+typedef enum { A_NONE=0, A_STOP_8S } alarm_action_t;
+volatile alarm_action_t g_alarm_action = A_NONE;
+
+/* ========= Prototypes ========= */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_RTC_Init(void);
+
+static uint8_t RTC_IsValid(void);
+static void    LEDs_UpdatePattern(sys_state_t st, uint32_t tick_ms);
+static uint8_t IsInWindow(uint8_t h, uint8_t m);
+static void    Refresh_State_ByTime(void);
+static void    Door_Open_8s(void);
+static void    Door_Close(void);
+static void    RTC_SetAlarm_AfterSeconds(uint32_t add_sec);
+
+/* ========= Main ========= */
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_RTC_Init();
+
+  /* On boot: decide state based on RTC validity and supervisor flag */
+  if (RTC_IsValid()) {
+    g_state = S_ENABLED_IDLE;        // will be refined by Refresh_State_ByTime()
+    g_supervisor_disabled = 0;
+  } else {
+    g_state = S_RTC_INVALID;
+    g_supervisor_disabled = 1;       // block requests until RTC set
+  }
+
+  /* Ensure relay is OFF at startup */
+  Door_Close();
+
+  uint32_t last_refresh = 0;
+  while (1) {
+    uint32_t now = HAL_GetTick();
+
+    /* Periodic time-based state refresh (e.g., every 500 ms) */
+    if (now - last_refresh >= 500) {
+      last_refresh = now;
+      Refresh_State_ByTime();
+    }
+
+    /* Update LEDs pattern (~50 ms cadence feels smooth) */
+    LEDs_UpdatePattern(g_state, now);
+
+    HAL_Delay(50);
+  }
+}
+
+/* ========= RTC Validity via Backup Register =========
+   Use a backup register flag (e.g., BKP_DR1 == 0x32F2) to mark time configured.
+   Make sure backup domain access is enabled in MX_RTC_Init. */
+static uint8_t RTC_IsValid(void)
+{
+  uint32_t MAGIC = 0x32F2;
+  return (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1) == MAGIC);
+}
+
+/* ========= Check windows: 07:45–12:00 and 13:00–17:30 ========= */
+static uint8_t IsInWindow(uint8_t h, uint8_t m)
+{
+  uint16_t mm = (uint16_t)h * 60 + m;
+  uint8_t in1 = (mm >= (7*60+45)) && (mm < (12*60+0));   // 07:45–11:59
+  uint8_t in2 = (mm >= (13*60+0)) && (mm < (17*60+30));  // 13:00–17:29
+  return (in1 || in2);
+}
+
+/* ========= Safe relay controls ========= */
+static void Door_Open_8s(void)
+{
+  HAL_GPIO_WritePin(RELAY_Port, RELAY_Pin, GPIO_PIN_SET);
+  g_door_open = 1;
+  g_state = S_DOOR_OPEN;
+  g_alarm_action = A_STOP_8S;
+  RTC_SetAlarm_AfterSeconds(8);
+}
+
+static void Door_Close(void)
+{
+  HAL_GPIO_WritePin(RELAY_Port, RELAY_Pin, GPIO_PIN_RESET);
+  g_door_open = 0;
+  /* After closing, return to enabled states depending on time and supervisor */
+  Refresh_State_ByTime();
+}
+
+/* ========= Recompute state from current time and supervisor/RTC flags ========= */
+static void Refresh_State_ByTime(void)
+{
+  if (!RTC_IsValid()) {
+    g_state = S_RTC_INVALID;
+    return;
+  }
+  if (g_supervisor_disabled) {
+    g_state = S_DISABLED;
+    return;
+  }
+  if (g_door_open) {
+    g_state = S_DOOR_OPEN;
+    return;
+  }
+
+  RTC_TimeTypeDef t; RTC_DateTypeDef d;
+  HAL_RTC_GetTime(&hrtc, &t, RTC_FORMAT_BIN);
+  HAL_RTC_GetDate(&hrtc, &d, RTC_FORMAT_BIN);
+
+  if (IsInWindow(t.Hours, t.Minutes)) g_state = S_ENABLED_WINDOW;
+  else                                g_state = S_ENABLED_IDLE;
+}
+
+/* ========= LED patterns (non-blocking), driven by SysTick ms =========
+   - RTC_INVALID:  Red blink 300/700, Green off
+   - DISABLED:     Red solid on,   Green off
+   - IDLE (out):   Green 1Hz blink, Red off
+   - WINDOW (in):  Green 2Hz blink, Red off
+   - DOOR_OPEN:    Green solid on,  Red off
+*/
+static void LEDs_UpdatePattern(sys_state_t st, uint32_t ms)
+{
+  switch (st) {
+    case S_RTC_INVALID:
+      HAL_GPIO_WritePin(LEDG_Port, LEDG_Pin, GPIO_PIN_RESET);
+      if ((ms % 1000) < 300) HAL_GPIO_WritePin(LEDR_Port, LEDR_Pin, GPIO_PIN_SET);
+      else                   HAL_GPIO_WritePin(LEDR_Port, LEDR_Pin, GPIO_PIN_RESET);
+      break;
+
+    case S_DISABLED:
+      HAL_GPIO_WritePin(LEDG_Port, LEDG_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(LEDR_Port, LEDR_Pin, GPIO_PIN_SET);
+      break;
+
+    case S_ENABLED_IDLE:
+      HAL_GPIO_WritePin(LEDR_Port, LEDR_Pin, GPIO_PIN_RESET);
+      if ((ms % 1000) < 500) HAL_GPIO_WritePin(LEDG_Port, LEDG_Pin, GPIO_PIN_SET);
+      else                   HAL_GPIO_WritePin(LEDG_Port, LEDG_Pin, GPIO_PIN_RESET);
+      break;
+
+    case S_ENABLED_WINDOW:
+      HAL_GPIO_WritePin(LEDR_Port, LEDR_Pin, GPIO_PIN_RESET);
+      if ((ms % 500) < 250) HAL_GPIO_WritePin(LEDG_Port, LEDG_Pin, GPIO_PIN_SET);
+      else                  HAL_GPIO_WritePin(LEDG_Port, LEDG_Pin, GPIO_PIN_RESET);
+      break;
+
+    case S_DOOR_OPEN:
+      HAL_GPIO_WritePin(LEDR_Port, LEDR_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(LEDG_Port, LEDG_Pin, GPIO_PIN_SET);
+      break;
+  }
+}
+
+/* ========= RTC Alarm helper: set AlarmA at now + add_sec (mod 24h) ========= */
+static void RTC_SetAlarm_AfterSeconds(uint32_t add_sec)
+{
+  RTC_TimeTypeDef t; RTC_DateTypeDef d;
+  HAL_RTC_GetTime(&hrtc, &t, RTC_FORMAT_BIN);
+  HAL_RTC_GetDate(&hrtc, &d, RTC_FORMAT_BIN);
+
+  uint32_t now = t.Hours*3600u + t.Minutes*60u + t.Seconds;
+  uint32_t trg = (now + add_sec) % 86400u;
+
+  RTC_AlarmTypeDef sAlarm = {0};
+  sAlarm.Alarm = RTC_ALARM_A;
+  sAlarm.AlarmTime.Hours   = (trg / 3600u) % 24u;
+  sAlarm.AlarmTime.Minutes = (trg / 60u) % 60u;
+  sAlarm.AlarmTime.Seconds = trg % 60u;
+  sAlarm.AlarmMask         = RTC_ALARMMASK_DATEWEEKDAY;      // daily alarm (ignore date)
+  sAlarm.AlarmSubSecondMask= RTC_ALARMSUBSECONDMASK_ALL;
+
+  HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_A);
+  HAL_RTC_SetAlarm_IT(&hrtc, &sAlarm, RTC_FORMAT_BIN);
+}
+
+/* ========= RTC callbacks ========= */
+void HAL_RTC_AlarmAEventCallback(RTC_HandleTypeDef *hr)
+{
+  /* If disabled or RTC invalid in the meantime, fail-safe close */
+  if (!RTC_IsValid() || g_supervisor_disabled) {
+    g_alarm_action = A_NONE;
+    Door_Close();
+    HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_A);
+    return;
+  }
+
+  if (g_alarm_action == A_STOP_8S) {
+    g_alarm_action = A_NONE;
+    Door_Close();              // exactly at 8s timeout
+  }
+}
+
+/* ========= EXTI callbacks (buttons) ========= */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  uint32_t now = HAL_GetTick();
+
+  if (GPIO_Pin == REQ_Pin) {
+    if (now - g_last_req_ms < 100) return;    // debounce ~100ms
+    g_last_req_ms = now;
+
+    if (RTC_IsValid() && !g_supervisor_disabled) {
+      /* Only if inside window */
+      RTC_TimeTypeDef t; RTC_DateTypeDef d;
+      HAL_RTC_GetTime(&hrtc, &t, RTC_FORMAT_BIN);
+      HAL_RTC_GetDate(&hrtc, &d, RTC_FORMAT_BIN);
+
+      if (IsInWindow(t.Hours, t.Minutes)) {
+        if (g_door_open) {
+          /* Extend: reset alarm to 8 s from now */
+          g_alarm_action = A_STOP_8S;
+          RTC_SetAlarm_AfterSeconds(8);
+        } else {
+          /* Start: open and schedule close after 8 s */
+          Door_Open_8s();
+        }
+      }
+    }
+  }
+  else if (GPIO_Pin == SUP_Pin) {
+    if (now - g_last_sup_ms < 120) return;    // debounce ~120ms
+    g_last_sup_ms = now;
+
+    g_supervisor_disabled ^= 1;
+    if (g_supervisor_disabled) {
+      /* Disabling: force safe close and clear alarms */
+      HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_A);
+      g_alarm_action = A_NONE;
+      Door_Close();
+      g_state = S_DISABLED;
+    } else {
+      /* Enabling: recompute state from time */
+      Refresh_State_ByTime();
+    }
+  }
+}
+
+/* ========= IRQ Handlers ========= */
+void EXTI0_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(REQ_Pin); }
+void EXTI1_IRQHandler(void) { HAL_GPIO_EXTI_IRQHandler(SUP_Pin); }
+void RTC_Alarm_IRQHandler(void) { HAL_RTC_AlarmIRQHandler(&hrtc); }
+
+/* ========= Minimal init (generate with CubeMX and adjust if needed) ========= */
+static void MX_GPIO_Init(void)
+{
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_AFIO_CLK_ENABLE();
+
+  /* Disable JTAG if you need PA15/PB3/PB4 (optional) */
+  __HAL_AFIO_REMAP_SWJ_NOJTAG();
+
+  GPIO_InitTypeDef gi = {0};
+
+  /* Relay: PA0 output */
+  gi.Pin = RELAY_Pin;
+  gi.Mode = GPIO_MODE_OUTPUT_PP;
+  gi.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(RELAY_Port, &gi);
+  HAL_GPIO_WritePin(RELAY_Port, RELAY_Pin, GPIO_PIN_RESET);
+
+  /* LEDs: PA1, PA2 output */
+  gi.Pin = LEDG_Pin | LEDR_Pin;
+  gi.Mode = GPIO_MODE_OUTPUT_PP;
+  gi.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LEDG_Port, &gi);
+  HAL_GPIO_WritePin(LEDG_Port, LEDG_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LEDR_Port, LEDR_Pin, GPIO_PIN_RESET);
+
+  /* Request button PB0 → EXTI0 (pull-up example) */
+  gi.Pin = REQ_Pin;
+  gi.Mode = GPIO_MODE_IT_FALLING;     // falling if pull-up wiring
+  gi.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(REQ_Port, &gi);
+
+  /* Supervisor button PB1 → EXTI1 */
+  gi.Pin = SUP_Pin;
+  gi.Mode = GPIO_MODE_IT_FALLING;
+  gi.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(SUP_Port, &gi);
+
+  /* NVIC for EXTI lines */
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+  HAL_NVIC_SetPriority(EXTI1_IRQn, 2, 1);
+  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+}
+
+static void MX_RTC_Init(void)
+{
+  /* Configure RTC: Prefer LSE (32.768 kHz). In CubeMX:
+     - Enable PWR/BKP clocks, HAL_PWR_EnableBkUpAccess()
+     - Select LSE as RTC clock source
+     - Initialize hrtc + prescalers
+     - Enable Alarm A interrupt
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.AsynchPrediv = 0x7F;
+  hrtc.Init.SynchPrediv  = 0x00FF;
+  hrtc.Init.HourFormat   = RTC_HOURFORMAT_24;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK) { Error_Handler(); }
+
+  /* If RTC time not set before, keep state as invalid (flag not written). 
+     When you set time in a separate UI/command, write the flag: */
+  // HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, 0x32F2);
+
+  /* NVIC for RTC Alarm */
+  HAL_NVIC_SetPriority(RTC_Alarm_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(RTC_Alarm_IRQn);
+}
+
+/* Provide your SystemClock_Config() from CubeMX */
+void SystemClock_Config(void)
+{
+  /* Generate with CubeMX according to your board (HSE/HSI, PLL, etc.) */
+}
+
+/* Simple trap */
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1) { }
+}
