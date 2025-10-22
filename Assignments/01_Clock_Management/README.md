@@ -1,13 +1,13 @@
-# 🧩 Assignment 01 – Clock Management in STM32 Microcontrollers
+#  Assignment 01 – Clock Management in STM32 Microcontrollers
 
-## 📘 Overview
+##  Overview
 This assignment focuses on understanding and configuring the **clock system (RCC)** in STM32 microcontrollers, especially in the STM32F1 family.  
 It explores the internal and external clock sources, PLL configuration, clock security features, and bus structures (AHB & APB).  
 The goal is to develop a solid understanding of how the system clock and peripheral clocks are generated, managed, and optimized for performance or low power.
 
 ---
 
-## 🧠 Assignment Questions
+##  Assignment Questions
 
 ### 1. Clock Management in STM32
 Answer the following questions clearly and concisely:
@@ -28,7 +28,7 @@ What are their characteristics, and which peripherals typically use each of them
 
 ---
 
-## 🎯 Learning Objectives
+##  Learning Objectives
 By completing this assignment, you will:
 - Understand the internal and external clock sources of STM32 (HSI, HSE, LSI, LSE, PLL).  
 - Learn the purpose and configuration of the PLL unit for frequency multiplication.  
@@ -38,19 +38,10 @@ By completing this assignment, you will:
 
 ---
 
-## ⚙️ Recommended Tools
+##  Recommended Tools
 - **STM32CubeIDE** (for clock tree visualization and configuration)  
 - **STM32CubeMX** (for generating initialization code)  
 - Reference Manual: `RM0008` (STM32F1) – RCC Section  
 
----
-
-## 🧾 Author
-**Ali Akbar Mohsennjad**  
-Embedded Systems Engineer | STM32 Developer  
-📧 [Email](mailto:pooyamohsennjad@gmail.com)  
-🔗 [LinkedIn](https://linkedin.com/in/ali-akbar-mohsennjad)
-
----
 
 
